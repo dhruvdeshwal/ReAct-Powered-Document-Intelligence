@@ -1,18 +1,31 @@
 """
 vector_store.py
 ----------------
-Wraps ChromaDB + HuggingFace (sentence-transformers) embeddings.
+Wraps ChromaDB + HuggingFace Inference Router embeddings.
+
+Why a custom embedding function:
+- ChromaDB's built-in HuggingFaceEmbeddingFunction calls the legacy
+  api-inference.huggingface.co endpoint, which is unreachable in some
+  environments (DNS failures).
+- This custom function calls HuggingFace's newer router endpoint:
+  https://router.huggingface.co/hf-inference/models/<model>/pipeline/feature-extraction
+- Embeddings are computed remotely, so the deployed app doesn't need to
+  load PyTorch/sentence-transformers locally (avoids OOM on Render free tier).
 
 Responsibilities:
 - Initialize a persistent ChromaDB collection
-- Embed and store document chunks with metadata
+- Embed and store document chunks with metadata (via HF router API)
 - Retrieve top-k similar chunks for a given query
 - List indexed documents
 """
 
 import os
+import requests
 import chromadb
-from chromadb.utils import embedding_functions
+from chromadb import Documents, EmbeddingFunction, Embeddings
+from dotenv import load_dotenv
+
+load_dotenv()
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -20,18 +33,77 @@ CHROMA_DIR = os.getenv(
     "CHROMA_DIR",
     os.path.join(BASE_DIR, "chroma_db")
 )
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+
+# HuggingFace Inference Router config
+HF_API_KEY = os.getenv("HF_API_KEY")  # get free token from https://huggingface.co/settings/tokens
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+
 COLLECTION_NAME = "documents"
 TOP_K = int(os.getenv("TOP_K", 4))
+
+
+class HFRouterEmbeddingFunction(EmbeddingFunction):
+    """
+    Custom ChromaDB-compatible embedding function that calls HuggingFace's
+    router endpoint for feature-extraction (embeddings), computed remotely.
+    """
+
+    def __init__(self, api_key: str, model_name: str = EMBEDDING_MODEL):
+        if not api_key:
+            raise RuntimeError(
+                "HF_API_KEY not set. Get a free token from "
+                "https://huggingface.co/settings/tokens and add it to your .env"
+            )
+        self.api_key = api_key
+        self.model_name = model_name
+        self.url = f"https://router.huggingface.co/hf-inference/models/{model_name}/pipeline/feature-extraction"
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def __call__(self, input: Documents) -> Embeddings:
+        # Chroma may call this with a single string or a list of strings
+        texts = input if isinstance(input, list) else [input]
+
+        response = requests.post(
+            self.url,
+            headers=self.headers,
+            json={"inputs": texts, "options": {"wait_for_model": True}},
+            timeout=60,
+        )
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"HuggingFace embedding request failed "
+                f"({response.status_code}): {response.text}"
+            )
+
+        embeddings = response.json()
+
+        # feature-extraction can return per-token embeddings (3D) for some models;
+        # mean-pool over tokens if so, to get a single vector per input.
+        result = []
+        for emb in embeddings:
+            if isinstance(emb[0], list):  # 2D -> token-level, needs pooling
+                num_tokens = len(emb)
+                dim = len(emb[0])
+                pooled = [sum(token[i] for token in emb) / num_tokens for i in range(dim)]
+                result.append(pooled)
+            else:  # already a flat vector
+                result.append(emb)
+
+        return result
 
 
 class VectorStore:
     def __init__(self, persist_dir: str = CHROMA_DIR, model_name: str = EMBEDDING_MODEL):
         self.client = chromadb.PersistentClient(path=persist_dir)
 
-        # HuggingFace sentence-transformers embedding function (runs locally, free)
-        self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=model_name
+        # Custom embedding function using HF router endpoint (remote, low RAM)
+        self.embedding_fn = HFRouterEmbeddingFunction(
+            api_key=HF_API_KEY,
+            model_name=model_name,
         )
 
         self.collection = self.client.get_or_create_collection(
@@ -66,8 +138,18 @@ class VectorStore:
             metadatas.append(metadata)
             ids.append(chunk_id)
 
-        self.collection.upsert(documents=documents, metadatas=metadatas, ids=ids)
-        return len(documents)
+        # HF Inference API has request size limits - batch in chunks of 32
+        batch_size = 32
+        total_added = 0
+        for i in range(0, len(documents), batch_size):
+            self.collection.upsert(
+                documents=documents[i:i + batch_size],
+                metadatas=metadatas[i:i + batch_size],
+                ids=ids[i:i + batch_size],
+            )
+            total_added += len(documents[i:i + batch_size])
+
+        return total_added
 
     def search(self, query: str, top_k: int = TOP_K, source_filter: str | None = None) -> list[dict]:
         """
